@@ -1,0 +1,1 @@
+"""stocks-webui application package."""

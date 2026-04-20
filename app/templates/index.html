@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>stocks-webui</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=M+PLUS+1p:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <p class="eyebrow">J-Quants Stock Lens</p>
+        <h1>4桁コードから、日本株の財務と株価をまとめて可視化</h1>
+        <p class="hero-copy">
+          J-Quants API から指定銘柄の開示情報と株価を取得し、利益推移、バリュエーション、週足トレンド、
+          業種平均まで 1 画面で確認できます。
+        </p>
+      </header>
+
+      <section class="panel search-panel">
+        <form id="analyze-form" class="search-form">
+          <label class="field">
+            <span>銘柄コード</span>
+            <input
+              id="code-input"
+              name="code"
+              type="text"
+              inputmode="numeric"
+              autocomplete="off"
+              placeholder="7203"
+              maxlength="5"
+              required
+            />
+          </label>
+          <button id="submit-button" type="submit">実行</button>
+        </form>
+        <div class="search-meta">
+          <p>4桁または5桁で入力できます。例: 7203 / 6758 / 9432</p>
+          <p id="status" class="status idle">待機中</p>
+        </div>
+      </section>
+
+      <section id="company-card" class="panel company-card hidden">
+        <div>
+          <p id="company-code" class="company-code"></p>
+          <h2 id="company-name"></h2>
+          <p id="company-name-en" class="company-name-en"></p>
+        </div>
+        <dl class="company-facts">
+          <div>
+            <dt>市場</dt>
+            <dd id="company-market"></dd>
+          </div>
+          <div>
+            <dt>業種</dt>
+            <dd id="company-industry"></dd>
+          </div>
+          <div>
+            <dt>最新株価日</dt>
+            <dd id="company-price-date"></dd>
+          </div>
+          <div>
+            <dt>最新開示日</dt>
+            <dd id="company-disclosure-date"></dd>
+          </div>
+        </dl>
+      </section>
+
+      <section id="metrics-grid" class="metrics-grid hidden"></section>
+
+      <section id="notes-card" class="panel hidden">
+        <h2>補足</h2>
+        <ul id="notes-list" class="notes-list"></ul>
+      </section>
+
+      <section id="charts-grid" class="charts-grid hidden">
+        <article class="panel chart-card wide">
+          <div class="section-head">
+            <h2>株価終値 週足</h2>
+            <p>25週・50週移動平均を重ねて表示</p>
+          </div>
+          <div class="chart-wrap"><canvas id="weekly-price-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card wide">
+          <div class="section-head">
+            <h2>出来高</h2>
+            <p>週次合計</p>
+          </div>
+          <div class="chart-wrap"><canvas id="volume-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card wide">
+          <div class="section-head">
+            <h2>時価総額 週足</h2>
+            <p>週末終値ベース</p>
+          </div>
+          <div class="chart-wrap"><canvas id="market-cap-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card third">
+          <div class="section-head">
+            <h2>PSR</h2>
+            <p>開示日時点の株価と財務データから算出</p>
+          </div>
+          <div class="chart-wrap compact"><canvas id="psr-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card third">
+          <div class="section-head">
+            <h2>PER</h2>
+            <p>開示日時点の株価と財務データから算出</p>
+          </div>
+          <div class="chart-wrap compact"><canvas id="per-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card third">
+          <div class="section-head">
+            <h2>PBR</h2>
+            <p>開示日時点の株価と財務データから算出</p>
+          </div>
+          <div class="chart-wrap compact"><canvas id="pbr-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card quarter">
+          <div class="section-head">
+            <h2>売上高</h2>
+            <p>各開示時点の累計実績値</p>
+          </div>
+          <div class="chart-wrap compact"><canvas id="sales-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card quarter">
+          <div class="section-head">
+            <h2>営業利益</h2>
+            <p>各開示時点の累計実績値</p>
+          </div>
+          <div class="chart-wrap compact"><canvas id="op-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card quarter">
+          <div class="section-head">
+            <h2>経常利益</h2>
+            <p>各開示時点の累計実績値</p>
+          </div>
+          <div class="chart-wrap compact"><canvas id="odp-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card quarter">
+          <div class="section-head">
+            <h2>純利益</h2>
+            <p>各開示時点の累計実績値</p>
+          </div>
+          <div class="chart-wrap compact"><canvas id="np-chart"></canvas></div>
+        </article>
+
+        <article class="panel chart-card wide">
+          <div class="section-head">
+            <h2>前年同期比</h2>
+            <p>各利益項目の前年同期比</p>
+          </div>
+          <div class="chart-wrap"><canvas id="yoy-chart"></canvas></div>
+        </article>
+      </section>
+    </div>
+  </body>
+</html>
