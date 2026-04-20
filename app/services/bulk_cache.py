@@ -51,7 +51,7 @@ class BulkDataCache:
         self.cache_root = Path(cache_dir or os.getenv("JQUANTS_CACHE_DIR", "cache/jquants"))
         self.cache_root.mkdir(parents=True, exist_ok=True)
 
-        self.summary_months = int(os.getenv("JQUANTS_BULK_MONTHS", "18"))
+        self.summary_months = int(os.getenv("JQUANTS_BULK_MONTHS", "60"))
         self._file_index_cache: dict[tuple[str, str], list[dict[str, object]]] = {}
 
     def _extract_file_date(self, key: str) -> pd.Timestamp | None:
@@ -164,6 +164,77 @@ class BulkDataCache:
         prices = prices.sort_values(["Code", "Date"], kind="stable")
         prices = prices.drop_duplicates(subset=["Code"], keep="last")
         return prices.reset_index(drop=True)
+
+    def load_price_snapshots(
+        self,
+        sector_codes: set[str],
+        target_dates: list[pd.Timestamp],
+        lookback_days: int = 14,
+    ) -> pd.DataFrame:
+        normalized_codes = {code.zfill(5) for code in sector_codes}
+        normalized_targets = sorted(
+            {
+                pd.Timestamp(value).normalize()
+                for value in target_dates
+                if value is not None and not pd.isna(value)
+            }
+        )
+        if not normalized_codes or not normalized_targets:
+            return pd.DataFrame(columns=["TargetDate", "Code", "Date", "C"])
+
+        available_entries: list[tuple[pd.Timestamp, str]] = []
+        for item in self._list_files("/equities/bars/daily"):
+            key = str(item["Key"])
+            file_date = self._extract_file_date(key)
+            if file_date is None:
+                continue
+            available_entries.append((file_date.normalize(), key))
+
+        selected_keys: set[str] = set()
+        for target_date in normalized_targets:
+            earliest_date = target_date - pd.Timedelta(days=lookback_days)
+            for file_date, key in available_entries:
+                if earliest_date <= file_date <= target_date:
+                    selected_keys.add(key)
+
+        frames: list[pd.DataFrame] = []
+        for key in sorted(selected_keys):
+            path = self.ensure_file(key)
+            frame = pd.read_csv(
+                path,
+                compression="gzip",
+                usecols=lambda column: column in self.DAILY_COLUMNS,
+                dtype={"Code": "string"},
+                low_memory=False,
+            )
+            frame["Code"] = frame["Code"].astype("string").str.zfill(5)
+            frame = frame[frame["Code"].isin(normalized_codes)]
+            if frame.empty:
+                continue
+            frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+            frame["C"] = pd.to_numeric(frame["C"], errors="coerce")
+            frames.append(frame)
+
+        if not frames:
+            return pd.DataFrame(columns=["TargetDate", "Code", "Date", "C"])
+
+        daily_prices = pd.concat(frames, ignore_index=True)
+        daily_prices = daily_prices.sort_values(["Code", "Date"], kind="stable")
+
+        snapshots: list[pd.DataFrame] = []
+        for target_date in normalized_targets:
+            price_frame = daily_prices[daily_prices["Date"] <= target_date]
+            if price_frame.empty:
+                continue
+
+            latest = price_frame.drop_duplicates(subset=["Code"], keep="last").copy()
+            latest["TargetDate"] = target_date
+            snapshots.append(latest[["TargetDate", "Code", "Date", "C"]])
+
+        if not snapshots:
+            return pd.DataFrame(columns=["TargetDate", "Code", "Date", "C"])
+
+        return pd.concat(snapshots, ignore_index=True)
 
     def compute_sector_averages(self, sector_codes: list[str]) -> dict[str, float | int | None]:
         normalized_codes = {code.zfill(5) for code in sector_codes}

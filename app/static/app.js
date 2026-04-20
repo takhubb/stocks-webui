@@ -13,22 +13,27 @@ const metricBlueprint = [
 ];
 
 const datasetPalette = {
-  sales: { label: "売上高", color: "#c85b2f", fill: "rgba(200, 91, 47, 0.24)" },
-  op: { label: "営業利益", color: "#1e6f66", fill: "rgba(30, 111, 102, 0.2)" },
-  odp: { label: "経常利益", color: "#355f8d", fill: "rgba(53, 95, 141, 0.2)" },
-  np: { label: "純利益", color: "#8b7dd8", fill: "rgba(139, 125, 216, 0.2)" },
-  psr: { label: "PSR", color: "#c85b2f" },
-  per: { label: "PER", color: "#1e6f66" },
-  pbr: { label: "PBR", color: "#355f8d" },
-  close: { label: "終値", color: "#16283a" },
-  ma25: { label: "25週移動平均", color: "#c85b2f" },
-  ma50: { label: "50週移動平均", color: "#1e6f66" },
-  marketCap: { label: "時価総額", color: "#355f8d" },
-  volume: { label: "出来高", color: "#c85b2f" },
+  sales: { label: "売上高", color: "#6f7cff", fill: "rgba(111, 124, 255, 0.32)" },
+  op: { label: "営業利益", color: "#4ea6a6", fill: "rgba(78, 166, 166, 0.3)" },
+  odp: { label: "経常利益", color: "#8796ff", fill: "rgba(135, 150, 255, 0.28)" },
+  np: { label: "純利益", color: "#262b44", fill: "rgba(38, 43, 68, 0.24)" },
+  psr: { label: "PSR", color: "#6f7cff" },
+  per: { label: "PER", color: "#4ea6a6" },
+  pbr: { label: "PBR", color: "#262b44" },
+  roe: { label: "ROE", color: "#6f7cff" },
+  roa: { label: "ROA", color: "#4ea6a6" },
+  industry: { label: "業種平均", color: "#7a88a6" },
+  topix: { label: "TOPIX (100=起点)", color: "#d46e5b" },
+  close: { label: "終値", color: "#1f2740", fill: "rgba(31, 39, 64, 0.24)" },
+  ma25: { label: "25週移動平均", color: "#6f7cff" },
+  ma50: { label: "50週移動平均", color: "#4ea6a6" },
+  marketCap: { label: "時価総額", color: "#262b44" },
+  volume: { label: "出来高", color: "#6f7cff" },
 };
 
 const form = document.getElementById("analyze-form");
 const codeInput = document.getElementById("code-input");
+const searchSuggestions = document.getElementById("search-suggestions");
 const submitButton = document.getElementById("submit-button");
 const statusEl = document.getElementById("status");
 const companyCard = document.getElementById("company-card");
@@ -37,11 +42,48 @@ const chartsGrid = document.getElementById("charts-grid");
 const notesCard = document.getElementById("notes-card");
 const notesList = document.getElementById("notes-list");
 
+let searchDebounceTimer = null;
+let searchAbortController = null;
+let latestSuggestions = [];
+
 codeInput.value = "7203";
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   await analyze();
+});
+
+codeInput.addEventListener("input", (event) => {
+  scheduleSearchSuggestions(event.target.value);
+});
+
+codeInput.addEventListener("focus", () => {
+  scheduleSearchSuggestions(codeInput.value);
+});
+
+codeInput.addEventListener("blur", () => {
+  window.setTimeout(() => {
+    hideSearchSuggestions();
+  }, 120);
+});
+
+searchSuggestions.addEventListener("mousedown", (event) => {
+  event.preventDefault();
+});
+
+searchSuggestions.addEventListener("click", (event) => {
+  const button = event.target.closest(".search-suggestion");
+  if (!button) {
+    return;
+  }
+
+  const index = Number(button.dataset.index);
+  const item = latestSuggestions[index];
+  if (!item) {
+    return;
+  }
+
+  applySuggestion(item);
 });
 
 function setStatus(message, type) {
@@ -80,49 +122,78 @@ function formatMetric(value, format) {
   }
 }
 
-function lineDatasets(series, keys) {
-  return keys
-    .map((key) => {
-      const palette = datasetPalette[key];
-      const data = series[key];
-      if (!data || data.every((value) => value === null || Number.isNaN(value))) {
-        return null;
-      }
-      return {
-        label: palette.label,
-        data,
-        borderColor: palette.color,
-        backgroundColor: palette.fill || palette.color,
-        tension: 0.25,
-        borderWidth: 2.4,
-        pointRadius: 0,
-        spanGaps: true,
-      };
-    })
-    .filter(Boolean);
+function formatChartValue(value, valueType = "plain") {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "N/A";
+  }
+
+  switch (valueType) {
+    case "percent":
+      return `${value.toFixed(2)}%`;
+    case "ratio-1":
+      return value.toFixed(1);
+    case "compact-yen":
+      return `${formatCompact(value)}円`;
+    case "compact":
+      return formatCompact(value);
+    case "index":
+      return value.toFixed(1);
+    default:
+      return value.toFixed(2);
+  }
 }
 
-function barDatasets(series, keys) {
-  return keys
-    .map((key) => {
-      const palette = datasetPalette[key];
-      const data = series[key];
-      if (!data || data.every((value) => value === null || Number.isNaN(value))) {
-        return null;
-      }
-      return {
-        label: palette.label,
-        data,
-        borderColor: palette.color,
-        backgroundColor: palette.fill || palette.color,
-        borderRadius: 8,
-        borderWidth: 1,
-      };
-    })
-    .filter(Boolean);
+function hasUsableValues(data) {
+  return Array.isArray(data) && data.some((value) => value !== null && !Number.isNaN(value));
 }
 
-function baseOptions(valueType = "plain", showLegend = true) {
+function makeLineDataset(key, data, overrides = {}) {
+  if (!hasUsableValues(data)) {
+    return null;
+  }
+
+  const palette = datasetPalette[key] || {};
+  return {
+    type: overrides.type || "line",
+    label: overrides.label || palette.label || key,
+    data,
+    borderColor: overrides.borderColor || palette.color || "#1f2740",
+    backgroundColor: overrides.backgroundColor || palette.fill || palette.color || "#1f2740",
+    tension: overrides.tension ?? 0.34,
+    borderWidth: overrides.borderWidth ?? 2.4,
+    pointRadius: overrides.pointRadius ?? 0,
+    pointHoverRadius: overrides.pointHoverRadius ?? 3.5,
+    pointHitRadius: 18,
+    spanGaps: true,
+    fill: false,
+    borderDash: overrides.borderDash || [],
+    yAxisID: overrides.yAxisID,
+    valueType: overrides.valueType,
+  };
+}
+
+function makeBarDataset(key, data, overrides = {}) {
+  if (!hasUsableValues(data)) {
+    return null;
+  }
+
+  const palette = datasetPalette[key] || {};
+  return {
+    type: overrides.type || "bar",
+    label: overrides.label || palette.label || key,
+    data,
+    borderColor: overrides.borderColor || palette.color || "#1f2740",
+    backgroundColor: overrides.backgroundColor || palette.fill || palette.color || "#1f2740",
+    borderRadius: 12,
+    borderSkipped: false,
+    borderWidth: 1,
+    maxBarThickness: 32,
+    yAxisID: overrides.yAxisID,
+    valueType: overrides.valueType,
+  };
+}
+
+function baseOptions({ valueType = "plain", showLegend = true, extraScales = {} } = {}) {
   return {
     responsive: true,
     maintainAspectRatio: false,
@@ -130,30 +201,42 @@ function baseOptions(valueType = "plain", showLegend = true) {
       mode: "index",
       intersect: false,
     },
+    animation: {
+      duration: 500,
+      easing: "easeOutQuart",
+    },
     plugins: {
       legend: {
         display: showLegend,
         labels: {
           usePointStyle: true,
-          boxWidth: 8,
+          boxWidth: 10,
+          boxHeight: 10,
           padding: 18,
-          color: "#16283a",
+          color: "#50607d",
+          font: {
+            family: "Noto Sans JP",
+            size: 12,
+          },
         },
       },
       tooltip: {
+        backgroundColor: "rgba(24, 30, 50, 0.92)",
+        titleFont: {
+          family: "Manrope",
+          size: 13,
+          weight: "700",
+        },
+        bodyFont: {
+          family: "Noto Sans JP",
+          size: 12,
+        },
+        padding: 12,
+        cornerRadius: 14,
         callbacks: {
           label(context) {
-            const value = context.parsed.y;
-            if (value === null || value === undefined || Number.isNaN(value)) {
-              return `${context.dataset.label}: N/A`;
-            }
-            if (valueType === "percent") {
-              return `${context.dataset.label}: ${value.toFixed(2)}%`;
-            }
-            if (valueType === "compact-yen" || valueType === "compact") {
-              return `${context.dataset.label}: ${formatCompact(value)}`;
-            }
-            return `${context.dataset.label}: ${value.toFixed(2)}`;
+            const currentValueType = context.dataset.valueType || valueType;
+            return `${context.dataset.label}: ${formatChartValue(context.parsed.y, currentValueType)}`;
           },
         },
       },
@@ -161,31 +244,49 @@ function baseOptions(valueType = "plain", showLegend = true) {
     scales: {
       x: {
         grid: {
-          color: "rgba(22, 40, 58, 0.06)",
+          color: "rgba(114, 129, 160, 0.08)",
+          drawBorder: false,
         },
         ticks: {
-          color: "#617487",
+          color: "#72809b",
           maxRotation: 0,
           autoSkip: true,
+          maxTicksLimit: 8,
+          font: {
+            family: "Manrope",
+            size: 11,
+          },
         },
       },
       y: {
         grid: {
-          color: "rgba(22, 40, 58, 0.08)",
+          color: "rgba(114, 129, 160, 0.1)",
+          drawBorder: false,
         },
         ticks: {
-          color: "#617487",
+          color: "#72809b",
           callback(value) {
             if (valueType === "percent") {
               return `${value}%`;
             }
-            if (valueType === "compact-yen" || valueType === "compact") {
+            if (valueType === "ratio-1") {
+              return Number(value).toFixed(1);
+            }
+            if (valueType === "compact-yen") {
+              return formatCompact(value);
+            }
+            if (valueType === "compact") {
               return formatCompact(value);
             }
             return value;
           },
+          font: {
+            family: "Manrope",
+            size: 11,
+          },
         },
       },
+      ...extraScales,
     },
   };
 }
@@ -197,6 +298,171 @@ function renderChart(canvasId, config) {
 
   const context = document.getElementById(canvasId);
   charts[canvasId] = new Chart(context, config);
+}
+
+function normalizeSearchText(value) {
+  return (value || "").replace(/\s+/g, "").toLocaleLowerCase("ja-JP");
+}
+
+function hideSearchSuggestions() {
+  searchSuggestions.innerHTML = "";
+  searchSuggestions.classList.add("hidden");
+}
+
+function renderSearchSuggestions(items) {
+  searchSuggestions.innerHTML = "";
+
+  if (!items || items.length === 0) {
+    searchSuggestions.classList.add("hidden");
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  items.forEach((item, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "search-suggestion";
+    button.dataset.index = String(index);
+
+    const code = document.createElement("span");
+    code.className = "search-suggestion-code";
+    code.textContent = item.code || "N/A";
+
+    const body = document.createElement("span");
+    body.className = "search-suggestion-body";
+
+    const name = document.createElement("span");
+    name.className = "search-suggestion-name";
+    name.textContent = item.name || item.nameEn || "名称未設定";
+
+    const meta = document.createElement("span");
+    meta.className = "search-suggestion-meta";
+    meta.textContent = [item.market, item.industry].filter(Boolean).join(" / ");
+
+    body.append(name, meta);
+    button.append(code, body);
+    fragment.appendChild(button);
+  });
+
+  searchSuggestions.appendChild(fragment);
+  searchSuggestions.classList.remove("hidden");
+}
+
+function applySuggestion(item) {
+  codeInput.value = item.code || "";
+  hideSearchSuggestions();
+}
+
+function findExactSuggestionMatches(items, query) {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  return items.filter((item) =>
+    [item.code, item.name, item.nameEn]
+      .filter(Boolean)
+      .map((value) => normalizeSearchText(value))
+      .includes(normalizedQuery),
+  );
+}
+
+async function requestSearchSuggestions(query, signal) {
+  const response = await fetch(`/api/search?query=${encodeURIComponent(query)}`, { signal });
+  const payload = await response.json();
+
+  if (!response.ok) {
+    throw new Error(payload.detail || "銘柄候補の取得に失敗しました。");
+  }
+
+  return Array.isArray(payload.items) ? payload.items : [];
+}
+
+async function updateSearchSuggestions(query) {
+  const trimmed = query.trim();
+  if (trimmed.length < 2) {
+    latestSuggestions = [];
+    hideSearchSuggestions();
+    return;
+  }
+
+  if (searchAbortController) {
+    searchAbortController.abort();
+  }
+
+  const controller = new AbortController();
+  searchAbortController = controller;
+
+  try {
+    const items = await requestSearchSuggestions(trimmed, controller.signal);
+    if (searchAbortController !== controller) {
+      return;
+    }
+
+    latestSuggestions = items;
+    if (document.activeElement === codeInput) {
+      renderSearchSuggestions(items);
+    }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      return;
+    }
+    latestSuggestions = [];
+    hideSearchSuggestions();
+  } finally {
+    if (searchAbortController === controller) {
+      searchAbortController = null;
+    }
+  }
+}
+
+function scheduleSearchSuggestions(query) {
+  window.clearTimeout(searchDebounceTimer);
+
+  const trimmed = query.trim();
+  if (trimmed.length < 2) {
+    latestSuggestions = [];
+    hideSearchSuggestions();
+    return;
+  }
+
+  searchDebounceTimer = window.setTimeout(() => {
+    updateSearchSuggestions(trimmed);
+  }, 180);
+}
+
+async function resolveAnalyzeCode(rawValue) {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (/^\d{4,5}$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  const cachedExactMatches = findExactSuggestionMatches(latestSuggestions, trimmed);
+  if (cachedExactMatches.length === 1) {
+    applySuggestion(cachedExactMatches[0]);
+    return cachedExactMatches[0].code;
+  }
+
+  const items = await requestSearchSuggestions(trimmed);
+  latestSuggestions = items;
+  renderSearchSuggestions(items);
+
+  const exactMatches = findExactSuggestionMatches(items, trimmed);
+  if (exactMatches.length === 1) {
+    applySuggestion(exactMatches[0]);
+    return exactMatches[0].code;
+  }
+
+  if (items.length === 0) {
+    setStatus("一致する銘柄候補が見つかりません。", "error");
+  } else {
+    setStatus("銘柄名で入力した場合は候補から1件選択してください。", "error");
+  }
+  return null;
 }
 
 function renderCompany(company) {
@@ -241,116 +507,254 @@ function renderNotes(notes) {
   notesCard.classList.remove("hidden");
 }
 
+function renderValuationChart(canvasId, labels, companySeries, industrySeries, topixSeries, key, valueType = "plain") {
+  renderChart(canvasId, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        makeLineDataset(key, companySeries, { valueType }),
+        makeLineDataset("industry", industrySeries, { valueType }),
+        makeLineDataset("topix", topixSeries, {
+          yAxisID: "yTopix",
+          valueType: "index",
+          borderDash: [7, 6],
+          borderWidth: 2,
+        }),
+      ].filter(Boolean),
+    },
+    options: baseOptions({
+      valueType,
+      extraScales: {
+        yTopix: {
+          position: "right",
+          grid: {
+            drawOnChartArea: false,
+            drawBorder: false,
+          },
+          ticks: {
+            color: "#d46e5b",
+            callback(value) {
+              return value;
+            },
+            font: {
+              family: "Manrope",
+              size: 11,
+            },
+          },
+        },
+      },
+    }),
+  });
+}
+
+function renderEfficiencyChart(canvasId, labels, companySeries, industrySeries, key) {
+  renderChart(canvasId, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        makeLineDataset(key, companySeries, { valueType: "percent" }),
+        makeLineDataset("industry", industrySeries, {
+          valueType: "percent",
+          borderDash: [7, 6],
+        }),
+      ].filter(Boolean),
+    },
+    options: baseOptions({ valueType: "percent" }),
+  });
+}
+
 function renderCharts(chartData) {
   renderChart("weekly-price-chart", {
     type: "line",
     data: {
       labels: chartData.weeklyPrice.labels,
-      datasets: lineDatasets(chartData.weeklyPrice.series, ["close", "ma25", "ma50"]),
+      datasets: [
+        makeLineDataset("close", chartData.weeklyPrice.series.close),
+        makeLineDataset("ma25", chartData.weeklyPrice.series.ma25),
+        makeLineDataset("ma50", chartData.weeklyPrice.series.ma50),
+        makeLineDataset("topix", chartData.weeklyPrice.series.topix, {
+          yAxisID: "yTopix",
+          valueType: "index",
+          borderDash: [7, 6],
+          borderWidth: 2,
+        }),
+      ].filter(Boolean),
     },
-    options: baseOptions("plain"),
+    options: baseOptions({
+      extraScales: {
+        yTopix: {
+          position: "right",
+          grid: {
+            drawOnChartArea: false,
+            drawBorder: false,
+          },
+          ticks: {
+            color: "#d46e5b",
+            font: {
+              family: "Manrope",
+              size: 11,
+            },
+          },
+        },
+      },
+    }),
   });
 
   renderChart("volume-chart", {
     type: "line",
     data: {
       labels: chartData.weeklyVolume.labels,
-      datasets: lineDatasets(chartData.weeklyVolume.series, ["volume"]),
+      datasets: [makeLineDataset("volume", chartData.weeklyVolume.series.volume, { valueType: "compact" })].filter(
+        Boolean,
+      ),
     },
-    options: baseOptions("compact", false),
+    options: baseOptions({ valueType: "compact", showLegend: false }),
   });
 
   renderChart("market-cap-chart", {
     type: "line",
     data: {
       labels: chartData.weeklyMarketCap.labels,
-      datasets: lineDatasets(chartData.weeklyMarketCap.series, ["marketCap"]),
+      datasets: [
+        makeLineDataset("marketCap", chartData.weeklyMarketCap.series.marketCap, {
+          valueType: "compact-yen",
+        }),
+      ].filter(Boolean),
     },
-    options: baseOptions("compact-yen", false),
+    options: baseOptions({ valueType: "compact-yen", showLegend: false }),
   });
 
-  renderChart("psr-chart", {
-    type: "line",
-    data: {
-      labels: chartData.valuation.labels,
-      datasets: lineDatasets(chartData.valuation.series, ["psr"]),
-    },
-    options: baseOptions("plain", false),
-  });
+  renderValuationChart(
+    "psr-chart",
+    chartData.valuation.labels,
+    chartData.valuation.series.psr,
+    chartData.valuation.series.psrIndustry,
+    chartData.valuation.series.topix,
+    "psr",
+  );
+  renderValuationChart(
+    "per-chart",
+    chartData.valuation.labels,
+    chartData.valuation.series.per,
+    chartData.valuation.series.perIndustry,
+    chartData.valuation.series.topix,
+    "per",
+  );
+  renderValuationChart(
+    "pbr-chart",
+    chartData.valuation.labels,
+    chartData.valuation.series.pbr,
+    chartData.valuation.series.pbrIndustry,
+    chartData.valuation.series.topix,
+    "pbr",
+    "ratio-1",
+  );
 
-  renderChart("per-chart", {
-    type: "line",
-    data: {
-      labels: chartData.valuation.labels,
-      datasets: lineDatasets(chartData.valuation.series, ["per"]),
-    },
-    options: baseOptions("plain", false),
-  });
-
-  renderChart("pbr-chart", {
-    type: "line",
-    data: {
-      labels: chartData.valuation.labels,
-      datasets: lineDatasets(chartData.valuation.series, ["pbr"]),
-    },
-    options: baseOptions("plain", false),
-  });
+  renderEfficiencyChart(
+    "roe-chart",
+    chartData.efficiency.labels,
+    chartData.efficiency.series.roe,
+    chartData.efficiency.series.roeIndustry,
+    "roe",
+  );
+  renderEfficiencyChart(
+    "roa-chart",
+    chartData.efficiency.labels,
+    chartData.efficiency.series.roa,
+    chartData.efficiency.series.roaIndustry,
+    "roa",
+  );
 
   renderChart("sales-chart", {
     type: "bar",
     data: {
-      labels: chartData.profits.labels,
-      datasets: barDatasets(chartData.profits.series, ["sales"]),
+      labels: chartData.yearEndResults.labels,
+      datasets: [makeBarDataset("sales", chartData.yearEndResults.series.sales, { valueType: "compact-yen" })].filter(
+        Boolean,
+      ),
     },
-    options: baseOptions("compact-yen", false),
+    options: baseOptions({ valueType: "compact-yen", showLegend: false }),
   });
 
   renderChart("op-chart", {
     type: "bar",
     data: {
-      labels: chartData.profits.labels,
-      datasets: barDatasets(chartData.profits.series, ["op"]),
+      labels: chartData.yearEndResults.labels,
+      datasets: [makeBarDataset("op", chartData.yearEndResults.series.op, { valueType: "compact-yen" })].filter(
+        Boolean,
+      ),
     },
-    options: baseOptions("compact-yen", false),
+    options: baseOptions({ valueType: "compact-yen", showLegend: false }),
   });
 
   renderChart("odp-chart", {
     type: "bar",
     data: {
-      labels: chartData.profits.labels,
-      datasets: barDatasets(chartData.profits.series, ["odp"]),
+      labels: chartData.yearEndResults.labels,
+      datasets: [makeBarDataset("odp", chartData.yearEndResults.series.odp, { valueType: "compact-yen" })].filter(
+        Boolean,
+      ),
     },
-    options: baseOptions("compact-yen", false),
+    options: baseOptions({ valueType: "compact-yen", showLegend: false }),
   });
 
   renderChart("np-chart", {
     type: "bar",
     data: {
-      labels: chartData.profits.labels,
-      datasets: barDatasets(chartData.profits.series, ["np"]),
+      labels: chartData.yearEndResults.labels,
+      datasets: [makeBarDataset("np", chartData.yearEndResults.series.np, { valueType: "compact-yen" })].filter(
+        Boolean,
+      ),
     },
-    options: baseOptions("compact-yen", false),
+    options: baseOptions({ valueType: "compact-yen", showLegend: false }),
   });
 
-  renderChart("yoy-chart", {
+  renderChart("year-yoy-chart", {
     type: "line",
     data: {
-      labels: chartData.yoy.labels,
-      datasets: lineDatasets(chartData.yoy.series, ["sales", "op", "odp", "np"]),
+      labels: chartData.yearEndYoy.labels,
+      datasets: [
+        makeLineDataset("sales", chartData.yearEndYoy.series.sales, { valueType: "percent" }),
+        makeLineDataset("op", chartData.yearEndYoy.series.op, { valueType: "percent" }),
+        makeLineDataset("odp", chartData.yearEndYoy.series.odp, { valueType: "percent" }),
+        makeLineDataset("np", chartData.yearEndYoy.series.np, { valueType: "percent" }),
+      ].filter(Boolean),
     },
-    options: baseOptions("percent"),
+    options: baseOptions({ valueType: "percent" }),
+  });
+
+  renderChart("quarterly-yoy-chart", {
+    type: "line",
+    data: {
+      labels: chartData.quarterlyYoy.labels,
+      datasets: [
+        makeLineDataset("sales", chartData.quarterlyYoy.series.sales, { valueType: "percent" }),
+        makeLineDataset("op", chartData.quarterlyYoy.series.op, { valueType: "percent" }),
+        makeLineDataset("odp", chartData.quarterlyYoy.series.odp, { valueType: "percent" }),
+        makeLineDataset("np", chartData.quarterlyYoy.series.np, { valueType: "percent" }),
+      ].filter(Boolean),
+    },
+    options: baseOptions({ valueType: "percent" }),
   });
 
   chartsGrid.classList.remove("hidden");
 }
 
 async function analyze() {
-  const code = codeInput.value.trim();
-  if (!code) {
-    setStatus("銘柄コードを入力してください。", "error");
+  const rawInput = codeInput.value.trim();
+  if (!rawInput) {
+    setStatus("銘柄コードまたは銘柄名を入力してください。", "error");
     return;
   }
 
+  const code = await resolveAnalyzeCode(rawInput);
+  if (!code) {
+    return;
+  }
+
+  hideSearchSuggestions();
   submitButton.disabled = true;
   setStatus("J-Quants からデータを取得しています。初回は bulk キャッシュ構築で少し時間がかかります。", "loading");
 

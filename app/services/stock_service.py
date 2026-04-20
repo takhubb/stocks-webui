@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Any
 
@@ -46,7 +47,12 @@ class StockAnalysisService:
         if daily_df.empty:
             raise LookupError("株価データが取得できませんでした。")
 
-        sector_averages = self._load_sector_averages(company["S33"])
+        sector_context = self._build_sector_context(
+            sector_code=str(company.get("S33") or ""),
+            financial_df=financial_df,
+        )
+        latest_sector_metrics = sector_context["latest"]
+
         latest_financial = financial_df.iloc[-1]
         latest_daily = daily_df.iloc[-1]
         weekly_df = build_weekly_dataframe(daily_df, financial_df)
@@ -61,18 +67,37 @@ class StockAnalysisService:
         roa = self._compute_roa(latest_financial)
         peg = self._compute_peg(latest_financial, latest_close)
 
-        valuation_chart = self._build_valuation_chart(financial_df, daily_df)
-        profit_chart = self._build_profit_chart(financial_df)
-        yoy_chart = self._build_yoy_chart(financial_df)
-        weekly_price_chart = self._build_weekly_price_chart(weekly_df)
+        analysis_start = min(pd.Timestamp(financial_df["DiscDate"].min()), pd.Timestamp(daily_df["Date"].min()))
+        analysis_end = max(pd.Timestamp(financial_df["DiscDate"].max()), pd.Timestamp(daily_df["Date"].max()))
+        topix_df = self._load_topix_dataframe(start_date=analysis_start, end_date=analysis_end)
+
+        valuation_chart = self._build_valuation_chart(
+            financial_df=financial_df,
+            daily_df=daily_df,
+            sector_history=sector_context["history"],
+            topix_df=topix_df,
+        )
+        efficiency_chart = self._build_efficiency_chart(
+            financial_df=financial_df,
+            sector_history=sector_context["history"],
+        )
+        quarterly_yoy_chart = self._build_quarterly_yoy_chart(financial_df)
+        year_end_chart = self._build_year_end_results_chart(financial_df)
+        year_end_yoy_chart = self._build_year_end_yoy_chart(financial_df)
+        weekly_price_chart = self._build_weekly_price_chart(weekly_df, topix_df)
         weekly_market_cap_chart = self._build_weekly_market_cap_chart(weekly_df)
         weekly_volume_chart = self._build_weekly_volume_chart(weekly_df)
 
         notes: list[str] = []
         if financial_df["OdP"].isna().all():
             notes.append("IFRS 採用企業では経常利益が空欄になるため、該当系列は欠損する場合があります。")
-        if sector_averages["psr"] is None or sector_averages["per"] is None:
+        if latest_sector_metrics["psr"] is None or latest_sector_metrics["per"] is None:
             notes.append("業種平均 PSR / PER は同業種の開示状況によって算出できない場合があります。")
+        if topix_df.empty:
+            notes.append("TOPIX データが取得できなかったため、比較線は非表示になります。")
+        else:
+            notes.append("TOPIX は最初の表示時点を 100 とした指数化系列を右軸に表示しています。")
+        notes.append("年度末の業績と前年比は、全財務タイムラインの FY 位置にそろえて表示しています。")
         notes.append("業種平均は J-Quants の 33 業種（S33）単位で集計しています。")
 
         return {
@@ -94,24 +119,100 @@ class StockAnalysisService:
                 "roe": roe,
                 "roa": roa,
                 "peg": peg,
-                "industryAvgPSR": sector_averages["psr"],
-                "industryAvgPER": sector_averages["per"],
-                "industryPeerCount": sector_averages["peer_count"],
-                "industryPSRCount": sector_averages["psr_count"],
-                "industryPERCount": sector_averages["per_count"],
+                "industryAvgPSR": latest_sector_metrics["psr"],
+                "industryAvgPER": latest_sector_metrics["per"],
+                "industryPeerCount": latest_sector_metrics["peer_count"],
+                "industryPSRCount": latest_sector_metrics["psr_count"],
+                "industryPERCount": latest_sector_metrics["per_count"],
                 "latestClose": latest_close,
                 "latestMarketCap": to_optional_float(latest_market_cap),
             },
             "charts": {
                 "valuation": valuation_chart,
-                "profits": profit_chart,
-                "yoy": yoy_chart,
+                "efficiency": efficiency_chart,
+                "quarterlyYoy": quarterly_yoy_chart,
+                "yearEndResults": year_end_chart,
+                "yearEndYoy": year_end_yoy_chart,
                 "weeklyPrice": weekly_price_chart,
                 "weeklyMarketCap": weekly_market_cap_chart,
                 "weeklyVolume": weekly_volume_chart,
             },
             "notes": notes,
         }
+
+    def search_companies(self, query: str, limit: int = 8) -> list[dict[str, str | None]]:
+        term = (query or "").strip()
+        if not term:
+            return []
+
+        master_df = self._get_master_dataframe().copy()
+        if master_df.empty:
+            return []
+
+        for column in ("Code", "CoName", "CoNameEn", "MktNm", "S33Nm"):
+            if column not in master_df.columns:
+                master_df[column] = ""
+
+        master_df["Code"] = master_df["Code"].astype(str).str.zfill(5)
+        master_df["DisplayCode"] = master_df["Code"].map(display_stock_code)
+        master_df["CoName"] = master_df["CoName"].fillna("").astype(str)
+        master_df["CoNameEn"] = master_df["CoNameEn"].fillna("").astype(str)
+        master_df["MktNm"] = master_df["MktNm"].fillna("").astype(str)
+        master_df["S33Nm"] = master_df["S33Nm"].fillna("").astype(str)
+
+        compact_term = re.sub(r"\s+", "", term)
+        compact_term_lower = compact_term.casefold()
+        digits = re.sub(r"\D", "", term)
+
+        if not compact_term and not digits:
+            return []
+
+        company_name = master_df["CoName"].str.replace(r"\s+", "", regex=True)
+        company_name_en = master_df["CoNameEn"].str.replace(r"\s+", "", regex=True).str.casefold()
+        display_code = master_df["DisplayCode"]
+        code = master_df["Code"]
+
+        false_mask = pd.Series(False, index=master_df.index)
+        exact_code = false_mask.copy()
+        prefix_code = false_mask.copy()
+        if digits:
+            exact_code = display_code.eq(digits) | code.eq(digits)
+            prefix_code = display_code.str.startswith(digits) | code.str.startswith(digits)
+
+        exact_name = company_name.eq(compact_term) | company_name_en.eq(compact_term_lower)
+        prefix_name = company_name.str.startswith(compact_term) | company_name_en.str.startswith(compact_term_lower)
+        contains_name = company_name.str.contains(compact_term, regex=False) | company_name_en.str.contains(
+            compact_term_lower,
+            regex=False,
+        )
+
+        matched = master_df.loc[prefix_code | contains_name].copy()
+        if matched.empty:
+            return []
+
+        matched["exact_code_rank"] = exact_code.loc[matched.index].astype(int)
+        matched["prefix_code_rank"] = prefix_code.loc[matched.index].astype(int)
+        matched["exact_name_rank"] = exact_name.loc[matched.index].astype(int)
+        matched["prefix_name_rank"] = prefix_name.loc[matched.index].astype(int)
+
+        matched = matched.sort_values(
+            ["exact_code_rank", "exact_name_rank", "prefix_code_rank", "prefix_name_rank", "DisplayCode"],
+            ascending=[False, False, False, False, True],
+            kind="stable",
+        )
+
+        suggestions: list[dict[str, str | None]] = []
+        for _, row in matched.head(limit).iterrows():
+            suggestions.append(
+                {
+                    "code": display_stock_code(str(row.get("Code") or "")),
+                    "name": row.get("CoName") or None,
+                    "nameEn": row.get("CoNameEn") or None,
+                    "market": row.get("MktNm") or None,
+                    "industry": row.get("S33Nm") or None,
+                }
+            )
+        return suggestions
 
     def _load_financials(self, code: str) -> pd.DataFrame:
         rows = self.client.fetch_fins_summary(code)
@@ -123,6 +224,30 @@ class StockAnalysisService:
         rows = self.client.fetch_daily_bars(code=code, from_date=start_date, to_date=end_date)
         return prepare_daily_bar_dataframe(rows)
 
+    def _load_topix_dataframe(
+        self,
+        start_date: pd.Timestamp | Any,
+        end_date: pd.Timestamp | Any,
+    ) -> pd.DataFrame:
+        if pd.isna(start_date) or pd.isna(end_date):
+            return pd.DataFrame(columns=["Date", "C"])
+
+        try:
+            rows = self.client.fetch_topix_bars(
+                from_date=pd.Timestamp(start_date).strftime("%Y%m%d"),
+                to_date=pd.Timestamp(end_date).strftime("%Y%m%d"),
+            )
+        except Exception:
+            return pd.DataFrame(columns=["Date", "C"])
+
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return pd.DataFrame(columns=["Date", "C"])
+
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        frame["C"] = pd.to_numeric(frame["C"], errors="coerce")
+        return frame.sort_values("Date", kind="stable").reset_index(drop=True)
+
     def _get_master_dataframe(self) -> pd.DataFrame:
         today = date.today().isoformat()
         if self._master_cache and self._master_cache[0] == today:
@@ -131,19 +256,215 @@ class StockAnalysisService:
         rows = self.client.fetch_equity_master()
         frame = pd.DataFrame(rows)
         if frame.empty:
-            frame = pd.DataFrame(columns=["Code", "S33", "S33Nm"])
+            frame = pd.DataFrame(columns=["Code", "CoName", "CoNameEn", "MktNm", "S33", "S33Nm"])
         else:
             frame["Code"] = frame["Code"].astype(str).str.zfill(5)
 
         self._master_cache = (today, frame)
         return frame
 
-    def _load_sector_averages(self, sector_code: str) -> dict[str, float | int | None]:
+    def _load_sector_codes(self, sector_code: str) -> list[str]:
+        if not sector_code:
+            return []
         master_df = self._get_master_dataframe()
-        sector_codes = master_df.loc[master_df["S33"] == sector_code, "Code"].astype(str).tolist()
+        return master_df.loc[master_df["S33"] == sector_code, "Code"].astype(str).tolist()
+
+    def _build_sector_context(self, sector_code: str, financial_df: pd.DataFrame) -> dict[str, Any]:
+        empty_history = {
+            "psr": [None] * len(financial_df),
+            "per": [None] * len(financial_df),
+            "pbr": [None] * len(financial_df),
+            "roe": [None] * len(financial_df),
+            "roa": [None] * len(financial_df),
+        }
+        empty_latest = {
+            "psr": None,
+            "per": None,
+            "pbr": None,
+            "roe": None,
+            "roa": None,
+            "peer_count": 0,
+            "psr_count": 0,
+            "per_count": 0,
+            "pbr_count": 0,
+            "roe_count": 0,
+            "roa_count": 0,
+        }
+
+        sector_codes = self._load_sector_codes(sector_code)
         if not sector_codes:
-            return {"psr": None, "per": None, "peer_count": 0, "psr_count": 0, "per_count": 0}
-        return self.bulk_cache.compute_sector_averages(sector_codes)
+            return {"history": empty_history, "latest": empty_latest}
+
+        summary_frame = self.bulk_cache.load_summary_frame(set(sector_codes))
+        sector_financial_df = enrich_financial_dataframe(
+            prepare_financial_dataframe(summary_frame.to_dict(orient="records"))
+        )
+        if sector_financial_df.empty:
+            return {"history": empty_history, "latest": empty_latest}
+
+        price_snapshots = self.bulk_cache.load_price_snapshots(
+            sector_codes=set(sector_codes),
+            target_dates=financial_df["DiscDate"].tolist(),
+        )
+
+        return {
+            "history": self._compute_sector_timeline_averages(
+                company_financial_df=financial_df,
+                sector_financial_df=sector_financial_df,
+                price_snapshots=price_snapshots,
+            ),
+            "latest": self._compute_sector_latest_averages(
+                sector_financial_df=sector_financial_df,
+                sector_codes=set(sector_codes),
+            ),
+        }
+
+    def _compute_sector_latest_averages(
+        self,
+        sector_financial_df: pd.DataFrame,
+        sector_codes: set[str],
+    ) -> dict[str, float | int | None]:
+        if sector_financial_df.empty:
+            return {
+                "psr": None,
+                "per": None,
+                "pbr": None,
+                "roe": None,
+                "roa": None,
+                "peer_count": 0,
+                "psr_count": 0,
+                "per_count": 0,
+                "pbr_count": 0,
+                "roe_count": 0,
+                "roa_count": 0,
+            }
+
+        latest_financials = (
+            sector_financial_df.sort_values(["Code", "CurPerEn", "DiscDate", "DiscTime"], kind="stable")
+            .groupby("Code", sort=False)
+            .tail(1)
+            .copy()
+        )
+        latest_financials["ROE"] = latest_financials.apply(self._compute_roe, axis=1)
+        latest_financials["ROA"] = latest_financials.apply(self._compute_roa, axis=1)
+
+        latest_prices = self.bulk_cache.load_latest_prices(sector_codes)
+        latest_financials = latest_financials.merge(
+            latest_prices[["Code", "Date", "C"]],
+            on="Code",
+            how="left",
+        )
+
+        latest_financials["MarketCap"] = latest_financials["C"] * latest_financials["ShOutFY"]
+        latest_financials["PSR"] = np.where(
+            (latest_financials["MarketCap"] > 0) & (latest_financials["TTM_Sales"] > 0),
+            latest_financials["MarketCap"] / latest_financials["TTM_Sales"],
+            np.nan,
+        )
+        latest_financials["PER"] = np.where(
+            (latest_financials["MarketCap"] > 0) & (latest_financials["TTM_NP"] > 0),
+            latest_financials["MarketCap"] / latest_financials["TTM_NP"],
+            np.nan,
+        )
+        latest_financials["PBR"] = np.where(
+            (latest_financials["MarketCap"] > 0) & (latest_financials["Eq"] > 0),
+            latest_financials["MarketCap"] / latest_financials["Eq"],
+            np.nan,
+        )
+
+        return {
+            "psr": self._mean_or_none(latest_financials["PSR"]),
+            "per": self._mean_or_none(latest_financials["PER"]),
+            "pbr": self._mean_or_none(latest_financials["PBR"]),
+            "roe": self._mean_or_none(latest_financials["ROE"]),
+            "roa": self._mean_or_none(latest_financials["ROA"]),
+            "peer_count": int(latest_financials["Code"].nunique()),
+            "psr_count": int(pd.to_numeric(latest_financials["PSR"], errors="coerce").notna().sum()),
+            "per_count": int(pd.to_numeric(latest_financials["PER"], errors="coerce").notna().sum()),
+            "pbr_count": int(pd.to_numeric(latest_financials["PBR"], errors="coerce").notna().sum()),
+            "roe_count": int(pd.to_numeric(latest_financials["ROE"], errors="coerce").notna().sum()),
+            "roa_count": int(pd.to_numeric(latest_financials["ROA"], errors="coerce").notna().sum()),
+        }
+
+    def _compute_sector_timeline_averages(
+        self,
+        company_financial_df: pd.DataFrame,
+        sector_financial_df: pd.DataFrame,
+        price_snapshots: pd.DataFrame,
+    ) -> dict[str, list[float | None]]:
+        series: dict[str, list[float | None]] = {
+            "psr": [],
+            "per": [],
+            "pbr": [],
+            "roe": [],
+            "roa": [],
+        }
+
+        if sector_financial_df.empty:
+            return {key: [None] * len(company_financial_df) for key in series}
+
+        sector_financial_df = sector_financial_df.copy()
+        sector_financial_df["ROE"] = sector_financial_df.apply(self._compute_roe, axis=1)
+        sector_financial_df["ROA"] = sector_financial_df.apply(self._compute_roa, axis=1)
+
+        for _, row in company_financial_df.iterrows():
+            target_date = pd.to_datetime(row.get("DiscDate"), errors="coerce")
+            label = row.get("Label")
+            if pd.isna(target_date) or not label:
+                for key in series:
+                    series[key].append(None)
+                continue
+
+            disclosed_peers = sector_financial_df[
+                (sector_financial_df["Label"] == label) & (sector_financial_df["DiscDate"] <= target_date)
+            ].copy()
+            if disclosed_peers.empty:
+                for key in series:
+                    series[key].append(None)
+                continue
+
+            disclosed_peers = (
+                disclosed_peers.sort_values(["Code", "DiscDate", "DiscTime"], kind="stable")
+                .groupby("Code", sort=False)
+                .tail(1)
+                .copy()
+            )
+
+            series["roe"].append(self._mean_or_none(disclosed_peers["ROE"]))
+            series["roa"].append(self._mean_or_none(disclosed_peers["ROA"]))
+
+            snapshot = price_snapshots[
+                price_snapshots["TargetDate"] == pd.Timestamp(target_date).normalize()
+            ][["Code", "C"]]
+            if snapshot.empty:
+                series["psr"].append(None)
+                series["per"].append(None)
+                series["pbr"].append(None)
+                continue
+
+            valuation_frame = disclosed_peers.merge(snapshot, on="Code", how="left")
+            valuation_frame["MarketCap"] = valuation_frame["C"] * valuation_frame["ShOutFY"]
+            valuation_frame["PSR"] = np.where(
+                (valuation_frame["MarketCap"] > 0) & (valuation_frame["TTM_Sales"] > 0),
+                valuation_frame["MarketCap"] / valuation_frame["TTM_Sales"],
+                np.nan,
+            )
+            valuation_frame["PER"] = np.where(
+                (valuation_frame["MarketCap"] > 0) & (valuation_frame["TTM_NP"] > 0),
+                valuation_frame["MarketCap"] / valuation_frame["TTM_NP"],
+                np.nan,
+            )
+            valuation_frame["PBR"] = np.where(
+                (valuation_frame["MarketCap"] > 0) & (valuation_frame["Eq"] > 0),
+                valuation_frame["MarketCap"] / valuation_frame["Eq"],
+                np.nan,
+            )
+
+            series["psr"].append(self._mean_or_none(valuation_frame["PSR"]))
+            series["per"].append(self._mean_or_none(valuation_frame["PER"]))
+            series["pbr"].append(self._mean_or_none(valuation_frame["PBR"]))
+
+        return series
 
     def _compute_roe(self, latest_financial: pd.Series) -> float | None:
         average_equity = average_pair(latest_financial.get("Eq"), latest_financial.get("PrevSameEq"))
@@ -174,11 +495,18 @@ class StockAnalysisService:
         forward_per = latest_close / forecast_eps
         return to_optional_float(forward_per / growth_rate)
 
-    def _build_valuation_chart(self, financial_df: pd.DataFrame, daily_df: pd.DataFrame) -> dict[str, Any]:
-        labels: list[str] = []
+    def _build_valuation_chart(
+        self,
+        financial_df: pd.DataFrame,
+        daily_df: pd.DataFrame,
+        sector_history: dict[str, list[float | None]],
+        topix_df: pd.DataFrame,
+    ) -> dict[str, Any]:
+        labels: list[str] = financial_df["Label"].tolist()
         psr_values: list[float] = []
         per_values: list[float] = []
         pbr_values: list[float] = []
+        topix_reference = self._build_topix_reference_series(financial_df["DiscDate"].tolist(), topix_df)
 
         for _, row in financial_df.iterrows():
             disclosure_date = row.get("DiscDate")
@@ -197,7 +525,6 @@ class StockAnalysisService:
             if not pd.isna(market_cap) and row.get("Eq") is not None and row["Eq"] > 0:
                 pbr = market_cap / row["Eq"]
 
-            labels.append(self._format_date(disclosure_date) or "")
             psr_values.append(psr)
             per_values.append(per)
             pbr_values.append(pbr)
@@ -206,23 +533,31 @@ class StockAnalysisService:
             "labels": labels,
             "series": {
                 "psr": clean_series(psr_values),
+                "psrIndustry": sector_history["psr"],
                 "per": clean_series(per_values),
+                "perIndustry": sector_history["per"],
                 "pbr": clean_series(pbr_values),
+                "pbrIndustry": sector_history["pbr"],
+                "topix": topix_reference,
             },
         }
 
-    def _build_profit_chart(self, financial_df: pd.DataFrame) -> dict[str, Any]:
+    def _build_efficiency_chart(
+        self,
+        financial_df: pd.DataFrame,
+        sector_history: dict[str, list[float | None]],
+    ) -> dict[str, Any]:
         return {
             "labels": financial_df["Label"].tolist(),
             "series": {
-                "sales": clean_series(financial_df["Sales"].tolist()),
-                "op": clean_series(financial_df["OP"].tolist()),
-                "odp": clean_series(financial_df["OdP"].tolist()),
-                "np": clean_series(financial_df["NP"].tolist()),
+                "roe": [self._compute_roe(row) for _, row in financial_df.iterrows()],
+                "roeIndustry": sector_history["roe"],
+                "roa": [self._compute_roa(row) for _, row in financial_df.iterrows()],
+                "roaIndustry": sector_history["roa"],
             },
         }
 
-    def _build_yoy_chart(self, financial_df: pd.DataFrame) -> dict[str, Any]:
+    def _build_quarterly_yoy_chart(self, financial_df: pd.DataFrame) -> dict[str, Any]:
         return {
             "labels": financial_df["Label"].tolist(),
             "series": {
@@ -233,13 +568,37 @@ class StockAnalysisService:
             },
         }
 
-    def _build_weekly_price_chart(self, weekly_df: pd.DataFrame) -> dict[str, Any]:
+    def _build_year_end_results_chart(self, financial_df: pd.DataFrame) -> dict[str, Any]:
         return {
-            "labels": [self._format_date(value) or "" for value in weekly_df["Date"].tolist()],
+            "labels": financial_df["Label"].tolist(),
+            "series": {
+                "sales": self._year_end_series(financial_df, "Sales"),
+                "op": self._year_end_series(financial_df, "OP"),
+                "odp": self._year_end_series(financial_df, "OdP"),
+                "np": self._year_end_series(financial_df, "NP"),
+            },
+        }
+
+    def _build_year_end_yoy_chart(self, financial_df: pd.DataFrame) -> dict[str, Any]:
+        return {
+            "labels": financial_df["Label"].tolist(),
+            "series": {
+                "sales": self._year_end_series(financial_df, "YoY_Sales"),
+                "op": self._year_end_series(financial_df, "YoY_OP"),
+                "odp": self._year_end_series(financial_df, "YoY_OdP"),
+                "np": self._year_end_series(financial_df, "YoY_NP"),
+            },
+        }
+
+    def _build_weekly_price_chart(self, weekly_df: pd.DataFrame, topix_df: pd.DataFrame) -> dict[str, Any]:
+        weekly_dates = weekly_df["Date"].tolist()
+        return {
+            "labels": [self._format_date(value) or "" for value in weekly_dates],
             "series": {
                 "close": clean_series(weekly_df["AdjC"].tolist()),
                 "ma25": clean_series(weekly_df["MA25"].tolist()),
                 "ma50": clean_series(weekly_df["MA50"].tolist()),
+                "topix": self._build_topix_reference_series(weekly_dates, topix_df),
             },
         }
 
@@ -259,7 +618,49 @@ class StockAnalysisService:
             },
         }
 
+    def _build_topix_reference_series(
+        self,
+        date_values: list[Any],
+        topix_df: pd.DataFrame,
+    ) -> list[float | None]:
+        if topix_df.empty:
+            return [None] * len(date_values)
+
+        raw_values = [lookup_close_on_or_before(topix_df, value, column="C") for value in date_values]
+        normalized: list[float | None] = []
+        base_value = next(
+            (
+                float(value)
+                for value in raw_values
+                if value is not None and not pd.isna(value) and float(value) > 0
+            ),
+            None,
+        )
+        if base_value is None:
+            return [None] * len(date_values)
+
+        for value in raw_values:
+            if value is None or pd.isna(value):
+                normalized.append(None)
+                continue
+            normalized.append(to_optional_float((float(value) / base_value) * 100.0))
+        return normalized
+
+    def _year_end_series(self, financial_df: pd.DataFrame, column: str) -> list[float | None]:
+        values: list[float | None] = []
+        for _, row in financial_df.iterrows():
+            if row.get("CurPerType") != "FY":
+                values.append(None)
+                continue
+            values.append(to_optional_float(row.get(column)))
+        return values
+
+    def _mean_or_none(self, values: pd.Series) -> float | None:
+        numeric = pd.to_numeric(values, errors="coerce")
+        return to_optional_float(numeric.mean(skipna=True))
+
     def _format_date(self, value: Any) -> str | None:
         if value is None or pd.isna(value):
             return None
-        return pd.Timestamp(value).strftime("%Y-%m-%d")
+        timestamp = pd.Timestamp(value)
+        return timestamp.strftime("%Y-%m-%d")

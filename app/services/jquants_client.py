@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import Any
 
 import requests
@@ -27,11 +28,27 @@ class JQuantsClient:
         params: dict[str, Any] | None = None,
         timeout: int | None = None,
     ) -> dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}{path}",
-            params=params or {},
-            timeout=timeout or self.timeout,
-        )
+        response = None
+        max_retries = 3
+
+        for attempt in range(max_retries + 1):
+            response = self.session.get(
+                f"{self.BASE_URL}{path}",
+                params=params or {},
+                timeout=timeout or self.timeout,
+            )
+            if response.status_code < 500 and response.status_code != 429:
+                break
+            if attempt == max_retries:
+                break
+
+            retry_after = response.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after else 1.5 * (attempt + 1)
+            time.sleep(delay)
+
+        if response is None:  # pragma: no cover - defensive guard
+            raise RuntimeError(f"Request failed before a response was returned: {path}")
+
         response.raise_for_status()
         payload = response.json()
 
@@ -91,6 +108,14 @@ class JQuantsClient:
 
     def fetch_fins_summary(self, code: str) -> list[dict[str, Any]]:
         return self.paginate("/fins/summary", params={"code": code})
+
+    def fetch_topix_bars(
+        self,
+        from_date: str,
+        to_date: str,
+    ) -> list[dict[str, Any]]:
+        params = {"from": from_date, "to": to_date}
+        return self.paginate("/indices/bars/daily/topix", params=params)
 
     def fetch_bulk_file_list(self, endpoint: str) -> list[dict[str, Any]]:
         payload = self._request_json("/bulk/list", params={"endpoint": endpoint})

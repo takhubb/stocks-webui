@@ -38,6 +38,22 @@ async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+@app.get("/api/search")
+async def search(query: str) -> JSONResponse:
+    try:
+        items = analysis_service.search_companies(query)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logging.exception("search failed for query=%s", query)
+        raise HTTPException(
+            status_code=500,
+            detail="銘柄候補の検索中に予期しないエラーが発生しました。ログを確認してください。",
+        ) from exc
+
+    return JSONResponse({"items": items})
+
+
 @app.get("/api/analyze")
 async def analyze(code: str) -> JSONResponse:
     try:
