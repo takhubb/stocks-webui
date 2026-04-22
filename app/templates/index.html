@@ -31,24 +31,47 @@
             <label class="field">
               <span>銘柄コード / 銘柄名</span>
               <div class="search-input-wrap">
+                <span class="search-input-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" focusable="false">
+                    <path
+                      d="M10.5 4a6.5 6.5 0 1 0 4.05 11.58l4.44 4.44 1.42-1.42-4.44-4.44A6.5 6.5 0 0 0 10.5 4Zm0 2a4.5 4.5 0 1 1 0 9a4.5 4.5 0 0 1 0-9Z"
+                      fill="currentColor"
+                    />
+                  </svg>
+                </span>
                 <input
                   id="code-input"
                   name="code"
                   type="text"
                   inputmode="search"
                   autocomplete="off"
-                  placeholder="7203 / トヨタ自動車"
+                  autocapitalize="characters"
+                  spellcheck="false"
+                  enterkeyhint="search"
+                  placeholder="7203 / 141A / トヨタ自動車"
                   maxlength="64"
+                  role="combobox"
                   aria-autocomplete="list"
+                  aria-controls="search-suggestions"
+                  aria-expanded="false"
+                  aria-haspopup="listbox"
                   required
                 />
+                <button id="search-clear-button" class="search-clear hidden" type="button" aria-label="入力をクリア">
+                  <svg viewBox="0 0 24 24" focusable="false">
+                    <path
+                      d="m7.76 6.34 4.24 4.24 4.24-4.24 1.42 1.42L13.42 12l4.24 4.24-1.42 1.42L12 13.42l-4.24 4.24-1.42-1.42L10.58 12 6.34 7.76Z"
+                      fill="currentColor"
+                    />
+                  </svg>
+                </button>
                 <div id="search-suggestions" class="search-suggestions hidden" role="listbox" aria-label="銘柄候補"></div>
               </div>
             </label>
             <button id="submit-button" type="submit">分析する</button>
           </form>
           <div class="search-meta">
-            <p>銘柄名でも検索できます。候補を選ぶと 4 桁コードが入力されます。例: 7203 / トヨタ自動車 / ソニーグループ</p>
+            <p>4桁コード、英字入りコード、銘柄名で検索できます。候補はクリックまたは上下キー + Enter で選択できます。</p>
             <p id="status" class="status idle">待機中</p>
           </div>
         </section>

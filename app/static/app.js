@@ -33,6 +33,7 @@ const datasetPalette = {
 
 const form = document.getElementById("analyze-form");
 const codeInput = document.getElementById("code-input");
+const searchClearButton = document.getElementById("search-clear-button");
 const searchSuggestions = document.getElementById("search-suggestions");
 const submitButton = document.getElementById("submit-button");
 const statusEl = document.getElementById("status");
@@ -45,38 +46,82 @@ const notesList = document.getElementById("notes-list");
 let searchDebounceTimer = null;
 let searchAbortController = null;
 let latestSuggestions = [];
+let activeSuggestionIndex = -1;
+let selectedSuggestion = null;
+let isComposingSearch = false;
 
 codeInput.value = "7203";
+syncSearchClearButton();
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   await analyze();
 });
 
+codeInput.addEventListener("compositionstart", () => {
+  isComposingSearch = true;
+});
+
+codeInput.addEventListener("compositionend", (event) => {
+  isComposingSearch = false;
+  handleSearchInputChange(event.target.value);
+});
+
 codeInput.addEventListener("input", (event) => {
-  scheduleSearchSuggestions(event.target.value);
+  if (isComposingSearch) {
+    return;
+  }
+  handleSearchInputChange(event.target.value);
 });
 
 codeInput.addEventListener("focus", () => {
+  syncSearchClearButton();
+  if (latestSuggestions.length > 0 && codeInput.value.trim().length >= minimumSearchLength(codeInput.value)) {
+    renderSearchSuggestions(latestSuggestions);
+    return;
+  }
   scheduleSearchSuggestions(codeInput.value);
 });
 
 codeInput.addEventListener("blur", () => {
   window.setTimeout(() => {
     hideSearchSuggestions();
-  }, 120);
+  }, 160);
 });
 
-searchSuggestions.addEventListener("mousedown", (event) => {
-  event.preventDefault();
+codeInput.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    hideSearchSuggestions();
+    return;
+  }
+
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    if (!isSearchSuggestionsOpen()) {
+      if (latestSuggestions.length > 0) {
+        renderSearchSuggestions(latestSuggestions);
+      } else {
+        void updateSearchSuggestions(codeInput.value);
+        return;
+      }
+    }
+    moveActiveSuggestion(event.key === "ArrowDown" ? 1 : -1);
+    return;
+  }
+
+  if (event.key === "Enter" && isSearchSuggestionsOpen() && activeSuggestionIndex >= 0 && !isProbableStockCode(codeInput.value)) {
+    event.preventDefault();
+    commitActiveSuggestion();
+  }
 });
 
-searchSuggestions.addEventListener("click", (event) => {
+searchSuggestions.addEventListener("pointerdown", (event) => {
   const button = event.target.closest(".search-suggestion");
   if (!button) {
     return;
   }
 
+  event.preventDefault();
   const index = Number(button.dataset.index);
   const item = latestSuggestions[index];
   if (!item) {
@@ -84,6 +129,15 @@ searchSuggestions.addEventListener("click", (event) => {
   }
 
   applySuggestion(item);
+});
+
+searchClearButton.addEventListener("click", () => {
+  clearSelectedSuggestion();
+  codeInput.value = "";
+  hideSearchSuggestions();
+  syncSearchClearButton();
+  setStatus("待機中", "idle");
+  codeInput.focus();
 });
 
 function setStatus(message, type) {
@@ -300,13 +354,107 @@ function renderChart(canvasId, config) {
   charts[canvasId] = new Chart(context, config);
 }
 
+function minimumSearchLength(query) {
+  return isProbableStockCode(query) ? 1 : 2;
+}
+
 function normalizeSearchText(value) {
-  return (value || "").replace(/\s+/g, "").toLocaleLowerCase("ja-JP");
+  return (value || "").normalize("NFKC").replace(/\s+/g, "").toLocaleLowerCase("ja-JP");
+}
+
+function normalizeCodeInput(value) {
+  return (value || "").normalize("NFKC").replace(/\s+/g, "").toUpperCase();
+}
+
+function isProbableStockCode(value) {
+  return /^(?=.*\d)[0-9A-Z]{4,5}$/.test(normalizeCodeInput(value));
+}
+
+function isSearchSuggestionsOpen() {
+  return !searchSuggestions.classList.contains("hidden") && latestSuggestions.length > 0;
+}
+
+function syncSearchClearButton() {
+  searchClearButton.classList.toggle("hidden", !codeInput.value.trim());
+}
+
+function clearSelectedSuggestion() {
+  selectedSuggestion = null;
+  codeInput.dataset.resolvedCode = "";
+}
+
+function matchesSelectedSuggestionInput(value) {
+  if (!selectedSuggestion) {
+    return false;
+  }
+
+  const normalizedValue = normalizeCodeInput(value);
+  return [selectedSuggestion.code, selectedSuggestion.apiCode]
+    .filter(Boolean)
+    .map((item) => normalizeCodeInput(item))
+    .includes(normalizedValue);
+}
+
+function handleSearchInputChange(value) {
+  if (!matchesSelectedSuggestionInput(value)) {
+    clearSelectedSuggestion();
+  }
+  syncSearchClearButton();
+  scheduleSearchSuggestions(value);
+}
+
+function syncSuggestionAccessibilityState() {
+  codeInput.setAttribute("aria-expanded", isSearchSuggestionsOpen() ? "true" : "false");
+  if (isSearchSuggestionsOpen() && activeSuggestionIndex >= 0) {
+    codeInput.setAttribute("aria-activedescendant", `search-suggestion-${activeSuggestionIndex}`);
+    return;
+  }
+  codeInput.removeAttribute("aria-activedescendant");
+}
+
+function setActiveSuggestion(index) {
+  if (!latestSuggestions.length) {
+    activeSuggestionIndex = -1;
+    syncSuggestionAccessibilityState();
+    return;
+  }
+
+  const count = latestSuggestions.length;
+  activeSuggestionIndex = ((index % count) + count) % count;
+
+  const buttons = searchSuggestions.querySelectorAll(".search-suggestion");
+  buttons.forEach((button, buttonIndex) => {
+    const isActive = buttonIndex === activeSuggestionIndex;
+    button.classList.toggle("active", isActive);
+    button.setAttribute("aria-selected", isActive ? "true" : "false");
+    if (isActive) {
+      button.scrollIntoView({ block: "nearest" });
+    }
+  });
+  syncSuggestionAccessibilityState();
+}
+
+function moveActiveSuggestion(offset) {
+  if (!latestSuggestions.length) {
+    return;
+  }
+
+  const nextIndex = activeSuggestionIndex < 0 ? (offset > 0 ? 0 : latestSuggestions.length - 1) : activeSuggestionIndex + offset;
+  setActiveSuggestion(nextIndex);
+}
+
+function commitActiveSuggestion() {
+  const item = latestSuggestions[activeSuggestionIndex];
+  if (item) {
+    applySuggestion(item);
+  }
 }
 
 function hideSearchSuggestions() {
   searchSuggestions.innerHTML = "";
   searchSuggestions.classList.add("hidden");
+  activeSuggestionIndex = -1;
+  syncSuggestionAccessibilityState();
 }
 
 function renderSearchSuggestions(items) {
@@ -314,6 +462,8 @@ function renderSearchSuggestions(items) {
 
   if (!items || items.length === 0) {
     searchSuggestions.classList.add("hidden");
+    activeSuggestionIndex = -1;
+    syncSuggestionAccessibilityState();
     return;
   }
 
@@ -321,8 +471,11 @@ function renderSearchSuggestions(items) {
   items.forEach((item, index) => {
     const button = document.createElement("button");
     button.type = "button";
+    button.id = `search-suggestion-${index}`;
     button.className = "search-suggestion";
     button.dataset.index = String(index);
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", "false");
 
     const code = document.createElement("span");
     code.className = "search-suggestion-code";
@@ -346,11 +499,16 @@ function renderSearchSuggestions(items) {
 
   searchSuggestions.appendChild(fragment);
   searchSuggestions.classList.remove("hidden");
+  setActiveSuggestion(0);
 }
 
 function applySuggestion(item) {
+  selectedSuggestion = item;
   codeInput.value = item.code || "";
+  codeInput.dataset.resolvedCode = item.apiCode || item.code || "";
+  syncSearchClearButton();
   hideSearchSuggestions();
+  codeInput.focus({ preventScroll: true });
 }
 
 function findExactSuggestionMatches(items, query) {
@@ -360,7 +518,7 @@ function findExactSuggestionMatches(items, query) {
   }
 
   return items.filter((item) =>
-    [item.code, item.name, item.nameEn]
+    [item.code, item.apiCode, item.name, item.nameEn]
       .filter(Boolean)
       .map((value) => normalizeSearchText(value))
       .includes(normalizedQuery),
@@ -380,7 +538,7 @@ async function requestSearchSuggestions(query, signal) {
 
 async function updateSearchSuggestions(query) {
   const trimmed = query.trim();
-  if (trimmed.length < 2) {
+  if (normalizeSearchText(trimmed).length < minimumSearchLength(trimmed)) {
     latestSuggestions = [];
     hideSearchSuggestions();
     return;
@@ -420,7 +578,7 @@ function scheduleSearchSuggestions(query) {
   window.clearTimeout(searchDebounceTimer);
 
   const trimmed = query.trim();
-  if (trimmed.length < 2) {
+  if (normalizeSearchText(trimmed).length < minimumSearchLength(trimmed)) {
     latestSuggestions = [];
     hideSearchSuggestions();
     return;
@@ -437,14 +595,18 @@ async function resolveAnalyzeCode(rawValue) {
     return null;
   }
 
-  if (/^\d{4,5}$/.test(trimmed)) {
-    return trimmed;
+  if (matchesSelectedSuggestionInput(trimmed)) {
+    return codeInput.dataset.resolvedCode || selectedSuggestion?.apiCode || selectedSuggestion?.code || normalizeCodeInput(trimmed);
+  }
+
+  if (isProbableStockCode(trimmed)) {
+    return normalizeCodeInput(trimmed);
   }
 
   const cachedExactMatches = findExactSuggestionMatches(latestSuggestions, trimmed);
   if (cachedExactMatches.length === 1) {
     applySuggestion(cachedExactMatches[0]);
-    return cachedExactMatches[0].code;
+    return cachedExactMatches[0].apiCode || cachedExactMatches[0].code;
   }
 
   const items = await requestSearchSuggestions(trimmed);
@@ -454,13 +616,18 @@ async function resolveAnalyzeCode(rawValue) {
   const exactMatches = findExactSuggestionMatches(items, trimmed);
   if (exactMatches.length === 1) {
     applySuggestion(exactMatches[0]);
-    return exactMatches[0].code;
+    return exactMatches[0].apiCode || exactMatches[0].code;
+  }
+
+  if (items.length === 1) {
+    applySuggestion(items[0]);
+    return items[0].apiCode || items[0].code;
   }
 
   if (items.length === 0) {
     setStatus("一致する銘柄候補が見つかりません。", "error");
   } else {
-    setStatus("銘柄名で入力した場合は候補から1件選択してください。", "error");
+    setStatus("候補が複数あります。クリックまたは上下キー + Enter で1件選択してください。", "error");
   }
   return null;
 }

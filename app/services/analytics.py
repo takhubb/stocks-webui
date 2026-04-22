@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from typing import Any
 
 import numpy as np
@@ -31,19 +32,38 @@ FINANCIAL_NUMERIC_COLUMNS = [
     "NxFNp",
     "NxFEPS",
 ]
+STOCK_CODE_PATTERN = re.compile(r"^[0-9A-Z]{4,5}$")
+
+
+def normalize_stock_code_text(raw_code: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(raw_code or "")).strip().upper()
+    return re.sub(r"\s+", "", text)
 
 
 def normalize_stock_code(raw_code: str) -> str:
-    digits = re.sub(r"\D", "", raw_code or "")
-    if len(digits) == 4:
-        return f"{digits}0"
-    if len(digits) == 5:
-        return digits
-    raise ValueError("銘柄コードは4桁または5桁で入力してください。")
+    code = normalize_stock_code_text(raw_code)
+    if not STOCK_CODE_PATTERN.fullmatch(code):
+        raise ValueError("銘柄コードは英字を含む4文字または5文字で入力してください。")
+    if len(code) == 4:
+        return f"{code}0"
+    return code
 
 
 def display_stock_code(code: str) -> str:
-    return code[:4] if len(code) == 5 and code.endswith("0") else code
+    normalized = normalize_stock_code_text(code)
+    return normalized[:4] if len(normalized) == 5 and normalized.endswith("0") else normalized
+
+
+def normalize_stock_code_series(series: pd.Series) -> pd.Series:
+    normalized = (
+        series.fillna("")
+        .astype("string")
+        .str.normalize("NFKC")
+        .str.replace(r"\s+", "", regex=True)
+        .str.upper()
+    )
+    short_mask = normalized.str.fullmatch(r"[0-9A-Z]{4}")
+    return normalized.where(~short_mask, normalized + "0")
 
 
 def to_optional_float(value: Any) -> float | None:
@@ -115,7 +135,7 @@ def prepare_financial_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["Code"] = df["Code"].astype(str).str.zfill(5)
+    df["Code"] = normalize_stock_code_series(df["Code"])
     df["DocType"] = df["DocType"].fillna("").astype(str)
     df["CurPerType"] = df["CurPerType"].fillna("").astype(str)
     df = df[df["DocType"].str.contains("FinancialStatements", na=False)]
@@ -252,7 +272,7 @@ def prepare_daily_bar_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["Code"] = df["Code"].astype(str).str.zfill(5)
+    df["Code"] = normalize_stock_code_series(df["Code"])
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
     numeric_columns = ["O", "H", "L", "C", "Vo", "Va", "AdjFactor", "AdjO", "AdjH", "AdjL", "AdjC", "AdjVo"]

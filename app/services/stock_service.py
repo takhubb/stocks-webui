@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import date
 from typing import Any
 
@@ -16,6 +17,8 @@ from app.services.analytics import (
     enrich_financial_dataframe,
     lookup_close_on_or_before,
     normalize_stock_code,
+    normalize_stock_code_series,
+    normalize_stock_code_text,
     prepare_daily_bar_dataframe,
     prepare_financial_dataframe,
     to_optional_float,
@@ -140,9 +143,10 @@ class StockAnalysisService:
             "notes": notes,
         }
 
-    def search_companies(self, query: str, limit: int = 8) -> list[dict[str, str | None]]:
-        term = (query or "").strip()
-        if not term:
+    def search_companies(self, query: str, limit: int = 10) -> list[dict[str, str | None]]:
+        raw_term = unicodedata.normalize("NFKC", str(query or "")).strip()
+        compact_term = self._normalize_search_text(raw_term)
+        if not compact_term:
             return []
 
         master_df = self._get_master_dataframe().copy()
@@ -153,51 +157,97 @@ class StockAnalysisService:
             if column not in master_df.columns:
                 master_df[column] = ""
 
-        master_df["Code"] = master_df["Code"].astype(str).str.zfill(5)
+        master_df["Code"] = normalize_stock_code_series(master_df["Code"])
         master_df["DisplayCode"] = master_df["Code"].map(display_stock_code)
         master_df["CoName"] = master_df["CoName"].fillna("").astype(str)
         master_df["CoNameEn"] = master_df["CoNameEn"].fillna("").astype(str)
         master_df["MktNm"] = master_df["MktNm"].fillna("").astype(str)
         master_df["S33Nm"] = master_df["S33Nm"].fillna("").astype(str)
 
-        compact_term = re.sub(r"\s+", "", term)
-        compact_term_lower = compact_term.casefold()
-        digits = re.sub(r"\D", "", term)
-
-        if not compact_term and not digits:
-            return []
-
-        company_name = master_df["CoName"].str.replace(r"\s+", "", regex=True)
-        company_name_en = master_df["CoNameEn"].str.replace(r"\s+", "", regex=True).str.casefold()
+        company_name = self._normalize_search_series(master_df["CoName"])
+        company_name_en = self._normalize_search_series(master_df["CoNameEn"]).str.casefold()
+        market_name = self._normalize_search_series(master_df["MktNm"]).str.casefold()
+        industry_name = self._normalize_search_series(master_df["S33Nm"]).str.casefold()
         display_code = master_df["DisplayCode"]
         code = master_df["Code"]
+        display_code_search = display_code.astype(str).str.casefold()
+        code_search = code.astype(str).str.casefold()
 
-        false_mask = pd.Series(False, index=master_df.index)
-        exact_code = false_mask.copy()
-        prefix_code = false_mask.copy()
-        if digits:
-            exact_code = display_code.eq(digits) | code.eq(digits)
-            prefix_code = display_code.str.startswith(digits) | code.str.startswith(digits)
+        tokens = [self._normalize_search_text(token) for token in raw_term.split()]
+        tokens = [token for token in tokens if token]
+        query_casefold = compact_term.casefold()
+        code_query = normalize_stock_code_text(raw_term)
+        probable_code_query = bool(code_query) and any(char.isdigit() for char in code_query)
+        canonical_code_query = ""
+        if probable_code_query and re.fullmatch(r"[0-9A-Z]{4,5}", code_query):
+            canonical_code_query = code_query if len(code_query) == 5 else f"{code_query}0"
 
-        exact_name = company_name.eq(compact_term) | company_name_en.eq(compact_term_lower)
-        prefix_name = company_name.str.startswith(compact_term) | company_name_en.str.startswith(compact_term_lower)
-        contains_name = company_name.str.contains(compact_term, regex=False) | company_name_en.str.contains(
-            compact_term_lower,
-            regex=False,
-        )
+        match_mask = pd.Series(True, index=master_df.index)
+        for token in tokens or [compact_term]:
+            token_casefold = token.casefold()
+            token_mask = (
+                display_code_search.str.contains(token_casefold, regex=False)
+                | code_search.str.contains(token_casefold, regex=False)
+                | company_name.str.contains(token, regex=False)
+                | company_name_en.str.contains(token_casefold, regex=False)
+                | market_name.str.contains(token_casefold, regex=False)
+                | industry_name.str.contains(token_casefold, regex=False)
+            )
+            match_mask &= token_mask
 
-        matched = master_df.loc[prefix_code | contains_name].copy()
+        matched = master_df.loc[match_mask].copy()
         if matched.empty:
             return []
 
-        matched["exact_code_rank"] = exact_code.loc[matched.index].astype(int)
-        matched["prefix_code_rank"] = prefix_code.loc[matched.index].astype(int)
+        false_mask = pd.Series(False, index=master_df.index)
+        exact_display_code = false_mask.copy()
+        exact_api_code = false_mask.copy()
+        prefix_display_code = false_mask.copy()
+        prefix_api_code = false_mask.copy()
+        if probable_code_query:
+            query_code_casefold = code_query.casefold()
+            exact_display_code = display_code_search.eq(query_code_casefold)
+            prefix_display_code = display_code_search.str.startswith(query_code_casefold)
+            exact_api_code = code_search.eq(query_code_casefold)
+            prefix_api_code = code_search.str.startswith(query_code_casefold)
+            if canonical_code_query:
+                canonical_casefold = canonical_code_query.casefold()
+                exact_api_code = exact_api_code | code_search.eq(canonical_casefold)
+                prefix_api_code = prefix_api_code | code_search.str.startswith(canonical_casefold)
+
+        exact_name = company_name.eq(compact_term) | company_name_en.eq(query_casefold)
+        prefix_name = company_name.str.startswith(compact_term) | company_name_en.str.startswith(query_casefold)
+        contains_name = company_name.str.contains(compact_term, regex=False) | company_name_en.str.contains(
+            query_casefold,
+            regex=False,
+        )
+        contains_market = market_name.str.contains(query_casefold, regex=False)
+        contains_industry = industry_name.str.contains(query_casefold, regex=False)
+
+        matched["exact_display_code_rank"] = exact_display_code.loc[matched.index].astype(int)
+        matched["exact_api_code_rank"] = exact_api_code.loc[matched.index].astype(int)
+        matched["prefix_display_code_rank"] = prefix_display_code.loc[matched.index].astype(int)
+        matched["prefix_api_code_rank"] = prefix_api_code.loc[matched.index].astype(int)
         matched["exact_name_rank"] = exact_name.loc[matched.index].astype(int)
         matched["prefix_name_rank"] = prefix_name.loc[matched.index].astype(int)
+        matched["contains_name_rank"] = contains_name.loc[matched.index].astype(int)
+        matched["contains_market_rank"] = contains_market.loc[matched.index].astype(int)
+        matched["contains_industry_rank"] = contains_industry.loc[matched.index].astype(int)
 
         matched = matched.sort_values(
-            ["exact_code_rank", "exact_name_rank", "prefix_code_rank", "prefix_name_rank", "DisplayCode"],
-            ascending=[False, False, False, False, True],
+            [
+                "exact_display_code_rank",
+                "exact_api_code_rank",
+                "exact_name_rank",
+                "prefix_display_code_rank",
+                "prefix_api_code_rank",
+                "prefix_name_rank",
+                "contains_name_rank",
+                "contains_market_rank",
+                "contains_industry_rank",
+                "DisplayCode",
+            ],
+            ascending=[False, False, False, False, False, False, False, False, False, True],
             kind="stable",
         )
 
@@ -206,6 +256,7 @@ class StockAnalysisService:
             suggestions.append(
                 {
                     "code": display_stock_code(str(row.get("Code") or "")),
+                    "apiCode": str(row.get("Code") or "") or None,
                     "name": row.get("CoName") or None,
                     "nameEn": row.get("CoNameEn") or None,
                     "market": row.get("MktNm") or None,
@@ -258,10 +309,23 @@ class StockAnalysisService:
         if frame.empty:
             frame = pd.DataFrame(columns=["Code", "CoName", "CoNameEn", "MktNm", "S33", "S33Nm"])
         else:
-            frame["Code"] = frame["Code"].astype(str).str.zfill(5)
+            frame["Code"] = normalize_stock_code_series(frame["Code"])
 
         self._master_cache = (today, frame)
         return frame
+
+    @staticmethod
+    def _normalize_search_text(value: Any) -> str:
+        text = unicodedata.normalize("NFKC", str(value or ""))
+        return re.sub(r"\s+", "", text)
+
+    def _normalize_search_series(self, series: pd.Series) -> pd.Series:
+        return (
+            series.fillna("")
+            .astype("string")
+            .str.normalize("NFKC")
+            .str.replace(r"\s+", "", regex=True)
+        )
 
     def _load_sector_codes(self, sector_code: str) -> list[str]:
         if not sector_code:

@@ -9,7 +9,13 @@ import numpy as np
 import pandas as pd
 import requests
 
-from app.services.analytics import enrich_financial_dataframe, prepare_financial_dataframe, to_optional_float
+from app.services.analytics import (
+    enrich_financial_dataframe,
+    normalize_stock_code_series,
+    normalize_stock_code_text,
+    prepare_financial_dataframe,
+    to_optional_float,
+)
 from app.services.jquants_client import JQuantsClient
 
 
@@ -128,7 +134,7 @@ class BulkDataCache:
                 dtype={"Code": "string", "DiscNo": "string", "DocType": "string", "CurPerType": "string"},
                 low_memory=False,
             )
-            frame["Code"] = frame["Code"].astype("string").str.zfill(5)
+            frame["Code"] = normalize_stock_code_series(frame["Code"])
             frame = frame[frame["Code"].isin(sector_codes)]
             if not frame.empty:
                 frames.append(frame)
@@ -149,7 +155,7 @@ class BulkDataCache:
                 dtype={"Code": "string"},
                 low_memory=False,
             )
-            frame["Code"] = frame["Code"].astype("string").str.zfill(5)
+            frame["Code"] = normalize_stock_code_series(frame["Code"])
             frame = frame[frame["Code"].isin(sector_codes)]
             if frame.empty:
                 continue
@@ -171,7 +177,11 @@ class BulkDataCache:
         target_dates: list[pd.Timestamp],
         lookback_days: int = 14,
     ) -> pd.DataFrame:
-        normalized_codes = {code.zfill(5) for code in sector_codes}
+        normalized_codes = {
+            normalized
+            for code in sector_codes
+            if (normalized := normalize_stock_code_text(code))
+        }
         normalized_targets = sorted(
             {
                 pd.Timestamp(value).normalize()
@@ -207,7 +217,7 @@ class BulkDataCache:
                 dtype={"Code": "string"},
                 low_memory=False,
             )
-            frame["Code"] = frame["Code"].astype("string").str.zfill(5)
+            frame["Code"] = normalize_stock_code_series(frame["Code"])
             frame = frame[frame["Code"].isin(normalized_codes)]
             if frame.empty:
                 continue
@@ -237,7 +247,11 @@ class BulkDataCache:
         return pd.concat(snapshots, ignore_index=True)
 
     def compute_sector_averages(self, sector_codes: list[str]) -> dict[str, float | int | None]:
-        normalized_codes = {code.zfill(5) for code in sector_codes}
+        normalized_codes = {
+            normalized
+            for code in sector_codes
+            if (normalized := normalize_stock_code_text(code))
+        }
         summary_frame = self.load_summary_frame(normalized_codes)
         if summary_frame.empty:
             return {"psr": None, "per": None, "peer_count": 0, "psr_count": 0, "per_count": 0}
