@@ -1,0 +1,18 @@
+[project]
+name = "stocks-webui"
+version = "0.1.0"
+description = "Web UI for visualizing Japanese stock metrics with J-Quants API data."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.116.1",
+    "jinja2==3.1.6",
+    "numpy==2.3.4",
+    "pandas==2.3.3",
+    "python-dotenv==1.1.1",
+    "requests==2.32.5",
+    "uvicorn[standard]==0.35.0",
+]
+
+[tool.uv]
+package = false

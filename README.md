@@ -49,10 +49,8 @@ http://localhost:8000
 ## ローカル実行
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+uv sync
+uv run uvicorn app.main:app --reload
 ```
 
 ## 指標の考え方
@@ -82,5 +80,6 @@ app/
 cache/
 Dockerfile
 docker-compose.yml
-requirements.txt
+pyproject.toml
+uv.lock
 ```
